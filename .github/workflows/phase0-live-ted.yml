@@ -1,0 +1,104 @@
+name: Regulatory Demand Phase 0 Live TED
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  phase0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Materialize frozen v6 package
+        run: |
+          cat phase0/chunks/chunk_*.b64 | base64 -d > phase0-v6.zip
+          echo "7520b783a14e50d27a6b1b207f25c02d940c7c74929df7202e6fc88d6f350f22  phase0-v6.zip" | sha256sum -c -
+          unzip -q phase0-v6.zip -d phase0
+
+      - name: Install analysis dependencies
+        run: python -m pip install --upgrade pip requests pandas numpy pyarrow
+
+      - name: Verify frozen artifact hashes
+        run: |
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          m=json.loads(Path('phase0/FREEZE_MANIFEST.json').read_text())
+          for fn, spec in m['files'].items():
+              p=Path('phase0')/fn
+              h=hashlib.sha256(p.read_bytes()).hexdigest()
+              if h != spec['sha256']:
+                  raise SystemExit(f'FREEZE HASH FAILURE {fn}: {h} != {spec["sha256"]}')
+          print('Frozen v6 manifest verified')
+          PY
+
+      - name: Fetch live TED notice x country x CPV source
+        run: |
+          python phase0/fetch_live_ted.py \
+            --prereg phase0/phase0_preregistration.json \
+            --cpv-definitions phase0/cpv_definitions.json \
+            --out-source live_ted_source.csv \
+            --out-manifest live_fetch_manifest.json
+
+      - name: Build frozen Phase 0 panel
+        run: |
+          python phase0/build_phase0_panel.py \
+            --source live_ted_source.csv \
+            --prereg phase0/phase0_preregistration.json \
+            --country-registry phase0/nis2_country_registry.json \
+            --cpv-definitions phase0/cpv_definitions.json \
+            --out-panel phase0_panel.csv \
+            --out-meta phase0_panel_meta.json
+
+      - name: Run frozen hard gate
+        id: hardgate
+        shell: bash
+        run: |
+          set +e
+          python phase0/regulatory_demand_phase0_v6.py \
+            --panel phase0_panel.csv \
+            --panel-meta phase0_panel_meta.json \
+            --prereg phase0/phase0_preregistration.json \
+            --country-registry phase0/nis2_country_registry.json \
+            --cpv-definitions phase0/cpv_definitions.json \
+            --out phase0_results.json
+          rc=$?
+          echo "gate_exit_code=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 0 ]; then
+            echo "PHASE 0 OUTCOME: GO"
+            exit 0
+          elif [ "$rc" -eq 2 ]; then
+            echo "PHASE 0 OUTCOME: NO-GO (legitimate falsification outcome)"
+            exit 0
+          else
+            echo "PHASE 0 INVALID RUN: analysis exited $rc"
+            exit "$rc"
+          fi
+
+      - name: Print decision artifact
+        if: always()
+        run: |
+          if [ -f phase0_results.json ]; then cat phase0_results.json; fi
+
+      - name: Upload decision artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase0-live-ted-results
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            live_fetch_manifest.json
+            phase0_panel_meta.json
+            phase0_results.json
+            phase0_panel.csv
